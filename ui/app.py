@@ -440,7 +440,7 @@ def main():
     api_url = os.getenv("HORIZON_API_URL", DEFAULT_API_URL)
     
     interface = create_ui(api_url=api_url)
-    interface.launch(share=False, server_name="0.0.0.0", server_port=7860)
+    interface.launch(share=True, server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":
