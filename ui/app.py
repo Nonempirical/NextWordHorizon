@@ -437,10 +437,24 @@ def create_ui(api_url: str = DEFAULT_API_URL):
 def main():
     """Main function to start the UI."""
     import os
+    
+    # Detect if running in Google Colab
+    def is_colab():
+        """Check if running in Google Colab."""
+        try:
+            import google.colab
+            return True
+        except ImportError:
+            # Also check for Colab environment variables
+            return os.getenv("COLAB_RELEASE_TAG") is not None or os.getenv("COLAB_GPU") is not None
+    
     api_url = os.getenv("HORIZON_API_URL", DEFAULT_API_URL)
     
+    # Auto-share in Colab, use share=True for local (can be overridden with env var)
+    share = is_colab() or os.getenv("GRADIO_SHARE", "True").lower() == "true"
+    
     interface = create_ui(api_url=api_url)
-    interface.launch(share=True, server_name="0.0.0.0", server_port=7860)
+    interface.launch(share=share, server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":
