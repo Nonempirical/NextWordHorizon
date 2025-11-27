@@ -11,21 +11,14 @@ The UI can run locally or in a Colab environment.
 """
 
 import gradio as gr
-import requests
 import plotly.graph_objects as go
 from typing import Optional, Tuple
 import pandas as pd
+from fastapi.testclient import TestClient
+from api.server import app as fastapi_app
 
-DEFAULT_API_URL = "http://localhost:8000"
-
-
-def _check_api_available(api_url: str) -> bool:
-    """Check if the API server is available."""
-    try:
-        response = requests.get(f"{api_url}/health", timeout=2)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
-        return False
+# Create in-process API client
+inprocess_client = TestClient(fastapi_app)
 
 
 def explore_horizon(
@@ -34,8 +27,7 @@ def explore_horizon(
     max_depth: int,
     model_backend: str,
     model_name: str,
-    remote_base_url: str,
-    api_url: str = DEFAULT_API_URL
+    remote_base_url: str
 ) -> Tuple[go.Figure, go.Figure, pd.DataFrame]:
     """
     Calls the API to expand horizon and returns visualizations.
@@ -47,7 +39,6 @@ def explore_horizon(
         model_backend: "local" or "remote"
         model_name: Model name for local backend
         remote_base_url: Base URL for remote backend
-        api_url: URL to API server
         
     Returns:
         Tuple of (3D figure, 2D figure, data table)
@@ -66,42 +57,17 @@ def explore_horizon(
         if not model_name:
             raise ValueError("model_name is required for local backend")
         payload["model_name"] = model_name
-        payload["model_name"] = model_name
     elif model_backend == "remote":
         if not remote_base_url:
             raise ValueError("remote_base_url is required for remote backend")
         payload["remote_base_url"] = remote_base_url
     
-    # Check if API is available first
-    if not _check_api_available(api_url):
-        raise ValueError(
-            f"Cannot connect to API server at {api_url}. "
-            "Please make sure the API server is running. "
-            "Check the separate API server window or run: "
-            "uvicorn api.server:app --reload --host 0.0.0.0 --port 8000"
-        )
-    
-    # Call API
+    # Call API using in-process client
     try:
-        response = requests.post(
-            f"{api_url}/expand_horizon",
-            json=payload,
-            timeout=300  # 5 minute timeout for large models
-        )
+        response = inprocess_client.post("/expand_horizon", json=payload)
         response.raise_for_status()
         data = response.json()
-    except requests.exceptions.ConnectionError as e:
-        raise ValueError(
-            f"Cannot connect to API server at {api_url}. "
-            "The server may not be running or may have crashed. "
-            "Please check the API server window."
-        )
-    except requests.exceptions.Timeout as e:
-        raise ValueError(
-            f"Request to API server timed out. "
-            "The server may be overloaded or processing a large request."
-        )
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         raise ValueError(f"API request failed: {str(e)}")
     
     # Build 3D figure
@@ -337,13 +303,10 @@ def _create_data_table(data: dict) -> pd.DataFrame:
     return df
 
 
-def create_ui(api_url: str = DEFAULT_API_URL):
+def create_ui():
     """
     Creates and returns the Gradio interface.
     
-    Args:
-        api_url: URL to API server
-        
     Returns:
         Gradio Interface object
     """
@@ -395,12 +358,6 @@ def create_ui(api_url: str = DEFAULT_API_URL):
                     value=""
                 )
                 
-                api_url_input = gr.Textbox(
-                    label="API URL",
-                    value=api_url,
-                    placeholder="http://localhost:8000"
-                )
-                
                 explore_btn = gr.Button("Run / Explore", variant="primary")
             
             with gr.Column():
@@ -424,10 +381,10 @@ def create_ui(api_url: str = DEFAULT_API_URL):
         
         # Connect function to button
         explore_btn.click(
-            fn=lambda p, tk, md, mb, mn, rbu, api: explore_horizon(
-                p, tk, md, mb, mn, rbu, api
+            fn=lambda p, tk, md, mb, mn, rbu: explore_horizon(
+                p, tk, md, mb, mn, rbu
             ),
-            inputs=[prompt, top_k, max_depth, model_backend, model_name, remote_base_url, api_url_input],
+            inputs=[prompt, top_k, max_depth, model_backend, model_name, remote_base_url],
             outputs=[plot_3d, plot_2d, data_table]
         )
     
@@ -448,12 +405,10 @@ def main():
             # Also check for Colab environment variables
             return os.getenv("COLAB_RELEASE_TAG") is not None or os.getenv("COLAB_GPU") is not None
     
-    api_url = os.getenv("HORIZON_API_URL", DEFAULT_API_URL)
-    
     # Auto-share in Colab, use share=True for local (can be overridden with env var)
     share = is_colab() or os.getenv("GRADIO_SHARE", "True").lower() == "true"
     
-    interface = create_ui(api_url=api_url)
+    interface = create_ui()
     interface.launch(share=share, server_name="0.0.0.0", server_port=7860)
 
 
