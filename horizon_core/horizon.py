@@ -10,7 +10,7 @@ The tree represents different paths through probability space and can
 be used to visualize and analyze the model's predictions.
 """
 
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from .models import Node, Edge, HorizonResult, DepthStats
 from .adapters import ModelAdapter
 from .config import K, DEPTH
@@ -127,6 +127,7 @@ def expand_horizon(
     prompt: str,
     top_k: int = K,
     max_depth: int = DEPTH,
+    cancel_event: Optional[Any] = None,  # threading.Event or None
 ) -> HorizonResult:
     """Expands a probabilistic horizon tree from a given prompt."""
     if not prompt or not prompt.strip():
@@ -173,6 +174,12 @@ def expand_horizon(
         
         for node in current_frontier:
             if stop_expansion:
+                break
+            
+            # Check if cancelled
+            if cancel_event is not None and cancel_event.is_set():
+                stop_expansion = True
+                truncated = True
                 break
             
             # BEFORE calling the model: kolla budget
@@ -264,6 +271,12 @@ def expand_horizon(
             
             # Skapa barnnoder endast för de valda indexen
             for child_idx in child_indices:
+                # Check if cancelled
+                if cancel_event is not None and cancel_event.is_set():
+                    stop_expansion = True
+                    truncated = True
+                    break
+                
                 # Kolla budget innan vi skapar noden
                 if node_count >= MAX_NODES:
                     stop_expansion = True

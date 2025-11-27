@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List, Literal
 import uvicorn
 import os
 from pathlib import Path
+import threading
 
 from horizon_core.horizon import expand_horizon
 from horizon_core.projection import project_horizon_to_3d
@@ -31,6 +32,10 @@ app = FastAPI(
 
 # Cache for adapters (to avoid reloading models on every request)
 _adapter_cache: Dict[str, ModelAdapter] = {}
+
+# Global cancel mechanism for expansion requests
+_cancel_event = threading.Event()
+_cancel_lock = threading.Lock()
 
 
 class ExpandRequest(BaseModel):
@@ -236,10 +241,13 @@ async def expand_horizon_endpoint(request: ExpandRequest):
     Expands a horizon tree from given prompt and returns it with 3D projection.
     
     Flow:
-    1. Creates ModelAdapter based on model_backend
-    2. Calls expand_horizon() to build the tree
-    3. Calls project_horizon_to_3d() to project to 3D
-    4. Serializes result to JSON (without embeddings)
+    1. Cancels any previous expansion request
+    2. Creates ModelAdapter based on model_backend
+    3. Calls expand_horizon() to build the tree
+    4. Calls project_horizon_to_3d() to project to 3D
+    5. Serializes result to JSON (without embeddings)
+    
+    If a new request comes in while one is running, the previous one is cancelled.
     
     Args:
         request: ExpandRequest with prompt, parameters and model configuration
@@ -248,6 +256,11 @@ async def expand_horizon_endpoint(request: ExpandRequest):
         ExpandResponse with expanded tree including 3D projection
     """
     try:
+        # Cancel any previous expansion
+        with _cancel_lock:
+            _cancel_event.set()
+            _cancel_event.clear()  # Clear for this new request
+        
         # Step 1: Create ModelAdapter
         adapter = _create_adapter(
             model_backend=request.model_backend,
@@ -255,12 +268,13 @@ async def expand_horizon_endpoint(request: ExpandRequest):
             remote_base_url=request.remote_base_url
         )
         
-        # Step 2: Expand horizon tree
+        # Step 2: Expand horizon tree (pass cancel event)
         horizon_result = expand_horizon(
             adapter=adapter,
             prompt=request.prompt,
             top_k=request.top_k,
-            max_depth=request.max_depth
+            max_depth=request.max_depth,
+            cancel_event=_cancel_event
         )
         
         # Step 3: Project to 3D
