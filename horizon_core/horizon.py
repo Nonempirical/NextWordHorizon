@@ -17,6 +17,12 @@ from .config import K, DEPTH
 from .metrics import calculate_entropy_per_depth, calculate_branching_factor_per_depth
 import numpy as np
 
+# Horizon limiting parameters
+MAX_NODES = 30_000              # Global hård gräns för antal noder i ett HorizonResult
+MASS_CUTOFF = 0.95              # Hur mycket lokal sannolikhetsmassa vi vill täcka per nod
+MAX_CHILDREN_PER_NODE = 12      # Max antal barn per nod (efter diversitet)
+MIN_DIVERSITY_COSINE = 0.15     # Minsta cosinus-avstånd mellan barn (1 - cos_sim)
+
 
 def _build_sequence_from_node(node: Node, nodes_dict: Dict[str, Node], prompt_ids: List[int]) -> List[int]:
     """Builds a sequence of token IDs from root to given node."""
@@ -34,6 +40,86 @@ def _build_sequence_from_node(node: Node, nodes_dict: Dict[str, Node], prompt_id
     sequence.extend(path_tokens)
     
     return sequence
+
+
+def select_children_for_node(
+    token_ids: List[int],
+    probs: List[float],
+    embeddings: List[np.ndarray],
+    mass_cutoff: float = MASS_CUTOFF,
+    max_children: int = MAX_CHILDREN_PER_NODE,
+    min_diversity_cosine: float = MIN_DIVERSITY_COSINE,
+) -> List[int]:
+    """
+    Väljer en representativ, sannolikhetsviktad och diversifierad uppsättning barn för en nod.
+    
+    Antaganden:
+    - token_ids, probs, embeddings har samma längd
+    - probs är redan normaliserade (softmax)
+    - tokens är redan sorterade efter probs (störst först)
+    
+    Args:
+        token_ids: Lista med token IDs (sorterade efter sannolikhet, högst först)
+        probs: Lista med sannolikheter (redan normaliserade softmax, sorterade)
+        embeddings: Lista med embeddings för varje token (samma ordning)
+        mass_cutoff: Minsta sannolikhetsmassa att täcka (0-1)
+        max_children: Max antal barn att välja
+        min_diversity_cosine: Minsta cosinus-avstånd (1 - cos_sim) mellan valda barn
+        
+    Returns:
+        En lista med index i token_ids/probs/embeddings för de barn som ska skapas.
+    """
+    if len(token_ids) == 0:
+        return []
+    
+    # Säkerställ att de är sorterade efter sannolikhet (högst först)
+    # Om de redan är sorterade, argsort ger [0, 1, 2, ...]
+    sorted_indices = np.argsort(probs)[::-1]
+    
+    selected_indices = []
+    cumulative_mass = 0.0
+    selected_embeddings = []
+    
+    for idx in sorted_indices:
+        # Kolla om vi redan har tillräckligt med massa
+        if cumulative_mass >= mass_cutoff:
+            break
+        
+        # Kolla om vi redan har max antal barn
+        if len(selected_indices) >= max_children:
+            break
+        
+        # Hämta embedding för detta token
+        emb = embeddings[idx]
+        
+        # Konvertera till numpy om det behövs
+        if hasattr(emb, 'cpu'):
+            emb = emb.cpu().numpy()
+        elif not isinstance(emb, np.ndarray):
+            emb = np.array(emb)
+        
+        # Normalisera embedding för cosinus-avstånd
+        emb_norm = emb / (np.linalg.norm(emb) + 1e-8)
+        
+        # Kolla diversitet mot alla redan valda
+        is_diverse = True
+        for selected_emb in selected_embeddings:
+            # Beräkna cosinus-likhet
+            cos_sim = np.dot(emb_norm, selected_emb)
+            # Konvertera till avstånd: dist = 1 - cos_sim
+            distance = 1.0 - cos_sim
+            
+            if distance < min_diversity_cosine:
+                is_diverse = False
+                break
+        
+        # Om den är tillräckligt olik, lägg till
+        if is_diverse:
+            selected_indices.append(int(idx))
+            selected_embeddings.append(emb_norm)
+            cumulative_mass += probs[idx]
+    
+    return selected_indices
 
 
 def expand_horizon(
@@ -72,14 +158,25 @@ def expand_horizon(
     
     current_frontier: List[Node] = [root_node]
     node_counter = 0  # For generating unique node IDs
+    truncated = False  # Track if we hit MAX_NODES limit
     
     for depth in range(1, max_depth + 1):
         if len(current_frontier) == 0:
             break
         
+        # Kolla global node-begränsning
+        if len(nodes) >= MAX_NODES:
+            truncated = True
+            break
+        
         next_frontier: List[Node] = []
         
         for node in current_frontier:
+            # Kolla global node-begränsning innan varje nod-expansion
+            if len(nodes) >= MAX_NODES:
+                truncated = True
+                break
+            
             # Build sequence_ids = prompt + all tokens along path
             sequence_ids = _build_sequence_from_node(node, nodes_dict, prompt_ids)
             
@@ -112,6 +209,7 @@ def expand_horizon(
                 continue
             probs = exp_logits / exp_sum
             
+            # Hämta top-k tokens (mer än MAX_CHILDREN_PER_NODE för att ha utrymme för diversitet)
             top_k_indices = np.argsort(probs)[-top_k:][::-1]
             top_k_probs = probs[top_k_indices]
             
@@ -120,10 +218,58 @@ def expand_horizon(
                 continue
             top_k_probs_norm = top_k_probs / top_k_sum
             
-            # For each top-k token
-            for i, (token_id, local_prob) in enumerate(zip(top_k_indices, top_k_probs_norm)):
+            # Hämta embeddings för alla top-k tokens
+            # Vi behöver matcha token_ids, probs och embeddings
+            top_k_embeddings = []
+            top_k_token_ids = []
+            top_k_probs_filtered = []
+            
+            for i, idx in enumerate(top_k_indices):
+                try:
+                    emb = adapter.get_token_embedding(int(idx))
+                    # Konvertera till numpy
+                    if hasattr(emb, 'cpu'):
+                        emb = emb.cpu().numpy()
+                    elif not isinstance(emb, np.ndarray):
+                        emb = np.array(emb)
+                    top_k_embeddings.append(emb)
+                    top_k_token_ids.append(int(idx))
+                    top_k_probs_filtered.append(top_k_probs_norm[i])
+                except Exception:
+                    # Om embedding misslyckas, hoppa över denna token
+                    continue
+            
+            if len(top_k_token_ids) == 0:
+                continue
+            
+            # Normalisera probs igen efter att vi filtrerat bort tokens utan embeddings
+            if len(top_k_probs_filtered) > 0:
+                prob_sum = sum(top_k_probs_filtered)
+                if prob_sum > 0:
+                    top_k_probs_filtered = [p / prob_sum for p in top_k_probs_filtered]
+            
+            # Välj barn baserat på sannolikhet, massa och diversitet
+            child_indices = select_children_for_node(
+                token_ids=top_k_token_ids,
+                probs=top_k_probs_filtered,
+                embeddings=top_k_embeddings,
+                mass_cutoff=MASS_CUTOFF,
+                max_children=MAX_CHILDREN_PER_NODE,
+                min_diversity_cosine=MIN_DIVERSITY_COSINE,
+            )
+            
+            # Skapa barnnoder endast för de valda indexen
+            for child_idx in child_indices:
+                # Kolla global node-begränsning innan varje ny nod
+                if len(nodes) >= MAX_NODES:
+                    truncated = True
+                    break
+                
+                token_id = top_k_token_ids[child_idx]
+                local_prob = top_k_probs_filtered[child_idx]
+                
                 # Calculate cumulative_prob
-                cumulative_prob = node.cumulative_prob * local_prob
+                cumulative_prob = node.cumulative_prob * float(local_prob)
                 
                 # Generate unique node ID
                 node_counter += 1
@@ -154,6 +300,12 @@ def expand_horizon(
                     target_id=new_node.id
                 )
                 edges.append(edge)
+            
+            if truncated:
+                break
+        
+        if truncated:
+            break
         
         # Update current_frontier for next iteration
         current_frontier = next_frontier
@@ -209,6 +361,7 @@ def expand_horizon(
         edges=edges,
         root_node_id=root_node.id,
         max_depth=max_depth,
-        depth_stats=depth_stats
+        depth_stats=depth_stats,
+        truncated=truncated
     )
 

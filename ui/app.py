@@ -334,7 +334,7 @@ def create_ui():
                     )
                     max_depth = gr.Slider(
                         minimum=1,
-                        maximum=5,
+                        maximum=20,
                         value=3,
                         step=1,
                         label="Maximum depth"

@@ -72,6 +72,7 @@ class ExpandResponse(BaseModel):
     depth_stats: Dict[str, DepthStatsResponse]
     max_depth: int
     root_node_id: str
+    truncated: bool = False  # True om expansionen stoppades p.g.a. MAX_NODES
 
 
 def _create_adapter(
@@ -212,7 +213,8 @@ def _serialize_horizon_result(result: HorizonResult) -> Dict[str, Any]:
         "edges": edges,
         "depth_stats": depth_stats,
         "max_depth": result.max_depth,
-        "root_node_id": result.root_node_id
+        "root_node_id": result.root_node_id,
+        "truncated": result.truncated
     }
 
 

@@ -46,4 +46,5 @@ class HorizonResult:
     root_node_id: str
     max_depth: int
     depth_stats: Dict[int, DepthStats]
+    truncated: bool = False  # True om expansionen stoppades p.g.a. MAX_NODES
 
