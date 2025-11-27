@@ -159,21 +159,24 @@ def expand_horizon(
     current_frontier: List[Node] = [root_node]
     node_counter = 0  # For generating unique node IDs
     truncated = False  # Track if we hit MAX_NODES limit
+    node_count = 1  # Start with root node
     
     for depth in range(1, max_depth + 1):
         if len(current_frontier) == 0:
             break
         
-        # Kolla global node-begränsning
-        if len(nodes) >= MAX_NODES:
+        # Kolla global node-begränsning innan vi börjar expandera denna nivå
+        if node_count >= MAX_NODES:
             truncated = True
             break
         
         next_frontier: List[Node] = []
+        stop_expansion = False
         
         for node in current_frontier:
             # Kolla global node-begränsning innan varje nod-expansion
-            if len(nodes) >= MAX_NODES:
+            if node_count >= MAX_NODES:
+                stop_expansion = True
                 truncated = True
                 break
             
@@ -261,7 +264,8 @@ def expand_horizon(
             # Skapa barnnoder endast för de valda indexen
             for child_idx in child_indices:
                 # Kolla global node-begränsning innan varje ny nod
-                if len(nodes) >= MAX_NODES:
+                if node_count >= MAX_NODES:
+                    stop_expansion = True
                     truncated = True
                     break
                 
@@ -293,6 +297,7 @@ def expand_horizon(
                 nodes.append(new_node)
                 nodes_dict[new_node.id] = new_node
                 next_frontier.append(new_node)
+                node_count += 1  # Öka räknaren
                 
                 # Create Edge from parent to child
                 edge = Edge(
@@ -300,11 +305,17 @@ def expand_horizon(
                     target_id=new_node.id
                 )
                 edges.append(edge)
+                
+                # Kolla igen efter att ha lagt till noden
+                if node_count >= MAX_NODES:
+                    stop_expansion = True
+                    truncated = True
+                    break
             
-            if truncated:
+            if stop_expansion:
                 break
         
-        if truncated:
+        if stop_expansion:
             break
         
         # Update current_frontier for next iteration
