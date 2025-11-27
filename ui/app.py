@@ -348,8 +348,8 @@ def create_ui():
                 
                 model_name = gr.Textbox(
                     label="Model Name (for local backend)",
-                    placeholder="e.g. ./models/qwen2.5-1.5b, gpt2, Qwen/Qwen2.5-1.5B-Instruct",
-                    value="./models/qwen2.5-1.5b"
+                    placeholder="e.g. Qwen/Qwen2.5-1.5B-Instruct, gpt2, ./models/qwen2.5-1.5b",
+                    value="Qwen/Qwen2.5-1.5B-Instruct"
                 )
                 
                 remote_base_url = gr.Textbox(
