@@ -18,7 +18,7 @@ from .metrics import calculate_entropy_per_depth, calculate_branching_factor_per
 import numpy as np
 
 # Horizon limiting parameters
-MAX_NODES = 30_000              # Global hård gräns för antal noder i ett HorizonResult
+MAX_NODES = 150_000             # Global hård gräns för antal noder i ett HorizonResult
 MASS_CUTOFF = 0.95              # Hur mycket lokal sannolikhetsmassa vi vill täcka per nod
 MAX_CHILDREN_PER_NODE = 12      # Max antal barn per nod (efter diversitet)
 MIN_DIVERSITY_COSINE = 0.15     # Minsta cosinus-avstånd mellan barn (1 - cos_sim)
@@ -159,22 +159,23 @@ def expand_horizon(
     current_frontier: List[Node] = [root_node]
     node_counter = 0  # For generating unique node IDs
     truncated = False  # Track if we hit MAX_NODES limit
-    node_count = 1  # Start with root node
+    node_count = 0  # Antal icke-root-noder som faktiskt skapas
+    stop_expansion = False
     
     for depth in range(1, max_depth + 1):
+        if stop_expansion:
+            break
+        
         if len(current_frontier) == 0:
             break
         
-        # Kolla global node-begränsning innan vi börjar expandera denna nivå
-        if node_count >= MAX_NODES:
-            truncated = True
-            break
-        
         next_frontier: List[Node] = []
-        stop_expansion = False
         
         for node in current_frontier:
-            # Kolla global node-begränsning innan varje nod-expansion
+            if stop_expansion:
+                break
+            
+            # BEFORE calling the model: kolla budget
             if node_count >= MAX_NODES:
                 stop_expansion = True
                 truncated = True
@@ -263,7 +264,7 @@ def expand_horizon(
             
             # Skapa barnnoder endast för de valda indexen
             for child_idx in child_indices:
-                # Kolla global node-begränsning innan varje ny nod
+                # Kolla budget innan vi skapar noden
                 if node_count >= MAX_NODES:
                     stop_expansion = True
                     truncated = True
@@ -297,7 +298,7 @@ def expand_horizon(
                 nodes.append(new_node)
                 nodes_dict[new_node.id] = new_node
                 next_frontier.append(new_node)
-                node_count += 1  # Öka räknaren
+                node_count += 1  # Öka räknaren (räknar icke-root-noder)
                 
                 # Create Edge from parent to child
                 edge = Edge(
@@ -315,10 +316,6 @@ def expand_horizon(
             if stop_expansion:
                 break
         
-        if stop_expansion:
-            break
-        
-        # Update current_frontier for next iteration
         current_frontier = next_frontier
     
     # Calculate per-depth entropy and branching factor

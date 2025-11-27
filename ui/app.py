@@ -326,7 +326,7 @@ def create_ui():
                 
                 with gr.Row():
                     top_k = gr.Slider(
-                        minimum=5,
+                        minimum=1,
                         maximum=50,
                         value=20,
                         step=1,
