@@ -133,7 +133,7 @@ def _create_3d_plot(data: dict) -> go.Figure:
                     y=[source["proj"][1], target["proj"][1]],
                     z=[source["proj"][2], target["proj"][2]],
                     mode='lines',
-                    line=dict(color='gray', width=1),
+                    line=dict(color='gray', width=1, opacity=0.5),
                     showlegend=False,
                     hoverinfo='skip'
                 ))
