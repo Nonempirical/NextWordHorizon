@@ -23,13 +23,136 @@ import numpy as np
 inprocess_client = TestClient(fastapi_app)
 
 
+def _convert_to_word_level(data: dict) -> dict:
+    """
+    Converts token-level nodes to sequence-level nodes (sequence modeling view).
+    Each node represents a full sequence/path from root.
+    
+    Args:
+        data: Original data with token-level nodes
+        
+    Returns:
+        New data dict with sequence-level nodes
+    """
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+    
+    # Build node dictionary
+    node_dict = {n["id"]: n for n in nodes}
+    
+    # Function to get full sequence text from root to node
+    def get_sequence_text(node_id: str) -> str:
+        """Get the full text sequence from root to this node."""
+        tokens = []
+        current_id = node_id
+        while current_id in node_dict:
+            node = node_dict[current_id]
+            if node.get("token_text") and node.get("token_text") != "<ROOT>":
+                tokens.append(node.get("token_text", ""))
+            if node.get("parent_id") is None:
+                break
+            current_id = node.get("parent_id")
+        tokens.reverse()
+        # Join tokens, handling subword tokens
+        return "".join(tokens) if tokens else ""
+    
+    # Group nodes by their full sequence path
+    # Each unique sequence becomes a sequence-level node
+    sequence_to_node = {}  # sequence_text -> seq_node_data
+    node_to_sequence = {}   # node_id -> sequence_text
+    
+    for node in nodes:
+        if node.get("depth", 0) == 0:  # Skip root
+            continue
+        seq_text = get_sequence_text(node["id"])
+        if seq_text:
+            node_to_sequence[node["id"]] = seq_text
+            if seq_text not in sequence_to_node:
+                sequence_to_node[seq_text] = {
+                    "sequence_text": seq_text,
+                    "depth": node.get("depth", 0),
+                    "cumulative_prob": node.get("cumulative_prob", 0.0),
+                    "proj": node.get("proj"),
+                }
+            # Track the node with highest probability for this sequence
+            if node.get("cumulative_prob", 0.0) > sequence_to_node[seq_text].get("cumulative_prob", 0.0):
+                sequence_to_node[seq_text]["cumulative_prob"] = node.get("cumulative_prob", 0.0)
+                sequence_to_node[seq_text]["proj"] = node.get("proj")
+                sequence_to_node[seq_text]["depth"] = node.get("depth", 0)
+    
+    # Create sequence-level nodes
+    seq_nodes = []
+    sequence_id_map = {}  # sequence_text -> seq_node_id
+    for i, (seq_text, seq_data) in enumerate(sorted(sequence_to_node.items(), key=lambda x: (x[1]["depth"], -x[1]["cumulative_prob"]))):
+        seq_id = f"seq_{i}"
+        sequence_id_map[seq_text] = seq_id
+        # Get last token text for display
+        last_token = seq_text[-20:] if len(seq_text) > 20 else seq_text  # Show last 20 chars
+        seq_nodes.append({
+            "id": seq_id,
+            "parent_id": None,  # Will set based on parent sequence
+            "depth": seq_data["depth"],
+            "token_text": last_token,  # Display last part of sequence
+            "sequence_text": seq_text,  # Full sequence
+            "cumulative_prob": seq_data["cumulative_prob"],
+            "proj": seq_data["proj"]
+        })
+    
+    # Build sequence-level edges (parent sequence -> child sequence)
+    seq_edges = []
+    for edge in edges:
+        source_id, target_id = edge[0], edge[1]
+        source_seq = node_to_sequence.get(source_id)
+        target_seq = node_to_sequence.get(target_id)
+        
+        if source_seq and target_seq and source_seq != target_seq:
+            # Check if target is a continuation of source (target starts with source)
+            # For sequence modeling, target should be source + one more token
+            if target_seq.startswith(source_seq):
+                source_seq_id = sequence_id_map.get(source_seq)
+                target_seq_id = sequence_id_map.get(target_seq)
+                if source_seq_id and target_seq_id:
+                    # Set parent_id
+                    for seq_node in seq_nodes:
+                        if seq_node["id"] == target_seq_id:
+                            seq_node["parent_id"] = source_seq_id
+                    if [source_seq_id, target_seq_id] not in seq_edges:
+                        seq_edges.append([source_seq_id, target_seq_id])
+    
+    # Add root node
+    root_node = {
+        "id": "seq_root",
+        "parent_id": None,
+        "depth": 0,
+        "token_text": "<ROOT>",
+        "sequence_text": "",
+        "cumulative_prob": 1.0,
+        "proj": None
+    }
+    
+    # Set root as parent for depth-1 sequences
+    for seq_node in seq_nodes:
+        if seq_node.get("depth", 0) == 1 and seq_node.get("parent_id") is None:
+            seq_node["parent_id"] = "seq_root"
+    
+    return {
+        "nodes": [root_node] + seq_nodes,
+        "edges": seq_edges,
+        "depth_stats": data.get("depth_stats", {}),
+        "max_depth": data.get("max_depth", 0),
+        "root_node_id": "seq_root",
+        "truncated": data.get("truncated", False)
+    }
+
+
 def explore_horizon(
     prompt: str,
     top_k: int,
     max_depth: int,
     model_backend: str,
     model_name: str,
-    remote_base_url: str
+    remote_base_url: str,
+    view_mode: str = "token"
 ) -> Tuple[go.Figure, go.Figure, pd.DataFrame]:
     """
     Calls the API to expand horizon and returns visualizations.
@@ -72,8 +195,19 @@ def explore_horizon(
     except Exception as e:
         raise ValueError(f"API request failed: {str(e)}")
     
+    # Store original data for "both" mode
+    original_data = data.copy() if view_mode == "both" else None
+    
+    # Convert data based on view mode
+    if view_mode == "word":
+        data = _convert_to_word_level(data)
+    elif view_mode == "both":
+        # For "both", convert to word-level for the main plot
+        # (We'll show word-level as primary, token-level could be added as secondary)
+        data = _convert_to_word_level(data)
+    
     # Build 3D figure
-    fig_3d = _create_3d_plot(data)
+    fig_3d = _create_3d_plot(data, view_mode=view_mode, original_data=original_data)
     
     # Build 2D figure (BF/entropy per depth)
     fig_2d = _create_2d_plot(data)
@@ -84,7 +218,7 @@ def explore_horizon(
     return fig_3d, fig_2d, df
 
 
-def _create_3d_plot(data: dict) -> go.Figure:
+def _create_3d_plot(data: dict, view_mode: str = "token", original_data: Optional[dict] = None) -> go.Figure:
     """Creates a 3D Plotly figure of the horizon tree."""
     if not isinstance(data, dict) or "nodes" not in data or "edges" not in data:
         fig = go.Figure()
@@ -160,7 +294,11 @@ def _create_3d_plot(data: dict) -> go.Figure:
     depths = [n["depth"] for n in nodes_with_proj]
     cumulative_probs = [n["cumulative_prob"] for n in nodes_with_proj]
     node_ids = [n["id"] for n in nodes_with_proj]
-    token_texts = [n.get("token_text", "") or "" for n in nodes_with_proj]
+    # Get display text based on view mode
+    if view_mode == "word":
+        token_texts = [n.get("sequence_text", n.get("token_text", "") or "") for n in nodes_with_proj]
+    else:
+        token_texts = [n.get("token_text", "") or "" for n in nodes_with_proj]
     
     # Create node dictionary for quick lookup (only nodes with proj)
     node_dict = {n["id"]: n for n in nodes_with_proj}
@@ -261,8 +399,14 @@ def _create_3d_plot(data: dict) -> go.Figure:
             legendgroup="root"
         ))
     
+    if view_mode == "word":
+        view_title = "Sequence-Level (Word Modeling)"
+    elif view_mode == "both":
+        view_title = "Sequence-Level (Both Views)"
+    else:
+        view_title = "Token-Level"
     fig.update_layout(
-        title="3D Horizon Tree Visualization (Colored by First Token)",
+        title=f"3D Horizon Tree Visualization - {view_title} (Colored by First Token)",
         scene=dict(
             xaxis_title="X",
             yaxis_title="Y",
@@ -451,6 +595,13 @@ def create_ui():
                     value=""
                 )
                 
+                view_mode = gr.Radio(
+                    choices=["token", "word", "both"],
+                    value="token",
+                    label="View Mode",
+                    info="Token: individual tokens | Word: grouped into words | Both: show both views"
+                )
+                
                 explore_btn = gr.Button("Run / Explore", variant="primary")
             
             with gr.Column():
@@ -474,10 +625,10 @@ def create_ui():
         
         # Connect function to button
         explore_btn.click(
-            fn=lambda p, tk, md, mb, mn, rbu: explore_horizon(
-                p, tk, md, mb, mn, rbu
+            fn=lambda p, tk, md, mb, mn, rbu, vm: explore_horizon(
+                p, tk, md, mb, mn, rbu, vm
             ),
-            inputs=[prompt, top_k, max_depth, model_backend, model_name, remote_base_url],
+            inputs=[prompt, top_k, max_depth, model_backend, model_name, remote_base_url, view_mode],
             outputs=[plot_3d, plot_2d, data_table]
         )
     
