@@ -12,10 +12,12 @@ The UI can run locally or in a Colab environment.
 
 import gradio as gr
 import plotly.graph_objects as go
+import plotly.colors as pc
 from typing import Optional, Tuple
 import pandas as pd
 from fastapi.testclient import TestClient
 from api.server import app as fastapi_app
+import numpy as np
 
 # Create in-process API client
 inprocess_client = TestClient(fastapi_app)
@@ -107,6 +109,51 @@ def _create_3d_plot(data: dict) -> go.Figure:
         )
         return fig
     
+    # Create full node dictionary (including nodes without proj for path traversal)
+    all_node_dict = {n["id"]: n for n in nodes}
+    
+    # Function to find the first token (depth 1) for a given node
+    def get_first_token_id(node_id: str) -> Optional[str]:
+        """Returns the node_id of the first token (depth 1) in the chain."""
+        current_id = node_id
+        while current_id in all_node_dict:
+            node = all_node_dict[current_id]
+            if node.get("depth") == 1:
+                return current_id
+            if node.get("parent_id") is None:
+                return None  # Reached root
+            current_id = node.get("parent_id")
+        return None
+    
+    # Build mapping: node_id -> first_token_id
+    node_to_first_token = {}
+    for node in nodes_with_proj:
+        first_token_id = get_first_token_id(node["id"])
+        if first_token_id:
+            node_to_first_token[node["id"]] = first_token_id
+    
+    # Get unique first tokens and assign colors
+    unique_first_tokens = list(set(node_to_first_token.values()))
+    
+    # Use Plotly's qualitative color sequences for distinct colors
+    n_colors = len(unique_first_tokens)
+    if n_colors > 0:
+        # Use Plotly's qualitative color palette (supports up to 24 colors)
+        # Cycle through if we need more
+        qualitative_colors = pc.qualitative.Plotly + pc.qualitative.Set3 + pc.qualitative.Pastel
+        colors = [qualitative_colors[i % len(qualitative_colors)] for i in range(n_colors)]
+    else:
+        colors = ['#1f77b4']  # Default blue
+    
+    first_token_to_color = {token_id: colors[i] for i, token_id in enumerate(unique_first_tokens)}
+    
+    # Get first token text for legend
+    first_token_to_text = {}
+    for token_id in unique_first_tokens:
+        if token_id in all_node_dict:
+            token_text = all_node_dict[token_id].get("token_text", "") or ""
+            first_token_to_text[token_id] = token_text if token_text else f"Token {token_id}"
+    
     x_coords = [n["proj"][0] for n in nodes_with_proj]
     y_coords = [n["proj"][1] for n in nodes_with_proj]
     z_coords = [n["proj"][2] for n in nodes_with_proj]
@@ -115,70 +162,115 @@ def _create_3d_plot(data: dict) -> go.Figure:
     node_ids = [n["id"] for n in nodes_with_proj]
     token_texts = [n.get("token_text", "") or "" for n in nodes_with_proj]
     
-    # Create node dictionary for quick lookup
+    # Create node dictionary for quick lookup (only nodes with proj)
     node_dict = {n["id"]: n for n in nodes_with_proj}
     
     # Create figure
     fig = go.Figure()
     
-    # Add edges (lines between parent and child)
+    # Add edges (lines between parent and child) with colors based on first token
     for edge in edges:
         source_id, target_id = edge[0], edge[1]
         if source_id in node_dict and target_id in node_dict:
             source = node_dict[source_id]
             target = node_dict[target_id]
             if source["proj"] and target["proj"]:
+                # Get color based on target's first token (or source's if target is root)
+                edge_first_token = node_to_first_token.get(target_id) or node_to_first_token.get(source_id)
+                edge_color = first_token_to_color.get(edge_first_token, 'gray') if edge_first_token else 'gray'
+                
                 fig.add_trace(go.Scatter3d(
                     x=[source["proj"][0], target["proj"][0]],
                     y=[source["proj"][1], target["proj"][1]],
                     z=[source["proj"][2], target["proj"][2]],
                     mode='lines',
-                    line=dict(color='gray', width=1),
+                    line=dict(color=edge_color, width=1),
                     opacity=0.5,
                     showlegend=False,
                     hoverinfo='skip'
                 ))
     
-    # Add nodes (scatter3d)
-    # Size based on log(cumulative_prob) for better visual distinction
-    import numpy as np
+    # Add nodes (scatter3d) grouped by first token
     sizes = [max(5, 20 * np.log10(max(prob, 1e-6) + 1)) for prob in cumulative_probs]
     
-    # Color coding by depth
-    fig.add_trace(go.Scatter3d(
-        x=x_coords,
-        y=y_coords,
-        z=z_coords,
-        mode='markers+text',
-        marker=dict(
-            size=sizes,
-            color=depths,
-            colorscale='Viridis',
-            colorbar=dict(title="Depth"),
-            line=dict(width=1, color='black')
-        ),
-        text=token_texts,
-        textposition="middle center",
-        textfont=dict(size=8),
-        hovertemplate=(
-            '<b>%{text}</b><br>'
-            'ID: %{customdata[0]}<br>'
-            'Depth: %{customdata[1]}<br>'
-            'Cumulative Prob: %{customdata[2]:.4f}<extra></extra>'
-        ),
-        customdata=[[nid, d, p] for nid, d, p in zip(node_ids, depths, cumulative_probs)],
-        name="Nodes"
-    ))
+    # Group nodes by first token and create separate traces for legend
+    nodes_by_first_token = {}
+    nodes_without_first_token = []
+    for i, node_id in enumerate(node_ids):
+        first_token_id = node_to_first_token.get(node_id)
+        if first_token_id:
+            if first_token_id not in nodes_by_first_token:
+                nodes_by_first_token[first_token_id] = []
+            nodes_by_first_token[first_token_id].append(i)
+        else:
+            nodes_without_first_token.append(i)
+    
+    # Add a trace for each first token chain
+    for first_token_id, indices in nodes_by_first_token.items():
+        color = first_token_to_color.get(first_token_id, '#1f77b4')
+        token_text = first_token_to_text.get(first_token_id, f"Chain {first_token_id}")
+        
+        fig.add_trace(go.Scatter3d(
+            x=[x_coords[i] for i in indices],
+            y=[y_coords[i] for i in indices],
+            z=[z_coords[i] for i in indices],
+            mode='markers+text',
+            marker=dict(
+                size=[sizes[i] for i in indices],
+                color=color,
+                line=dict(width=1, color='black')
+            ),
+            text=[token_texts[i] for i in indices],
+            textposition="middle center",
+            textfont=dict(size=8),
+            hovertemplate=(
+                '<b>%{text}</b><br>'
+                'ID: %{customdata[0]}<br>'
+                'Depth: %{customdata[1]}<br>'
+                'Cumulative Prob: %{customdata[2]:.4f}<br>'
+                'First Token: %{customdata[3]}<extra></extra>'
+            ),
+            customdata=[[node_ids[i], depths[i], cumulative_probs[i], token_text] for i in indices],
+            name=token_text,
+            legendgroup=first_token_id
+        ))
+    
+    # Add nodes without a first token (e.g., root) in gray
+    if nodes_without_first_token:
+        fig.add_trace(go.Scatter3d(
+            x=[x_coords[i] for i in nodes_without_first_token],
+            y=[y_coords[i] for i in nodes_without_first_token],
+            z=[z_coords[i] for i in nodes_without_first_token],
+            mode='markers+text',
+            marker=dict(
+                size=[sizes[i] for i in nodes_without_first_token],
+                color='gray',
+                line=dict(width=1, color='black')
+            ),
+            text=[token_texts[i] for i in nodes_without_first_token],
+            textposition="middle center",
+            textfont=dict(size=8),
+            hovertemplate=(
+                '<b>%{text}</b><br>'
+                'ID: %{customdata[0]}<br>'
+                'Depth: %{customdata[1]}<br>'
+                'Cumulative Prob: %{customdata[2]:.4f}<extra></extra>'
+            ),
+            customdata=[[node_ids[i], depths[i], cumulative_probs[i], "Root/Unknown"] for i in nodes_without_first_token],
+            name="Root/Unknown",
+            legendgroup="root"
+        ))
     
     fig.update_layout(
-        title="3D Horizon Tree Visualization",
+        title="3D Horizon Tree Visualization (Colored by First Token)",
         scene=dict(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
             aspectmode='cube'
         ),
-        height=600
+        height=600,
+        showlegend=True
     )
     
     return fig
